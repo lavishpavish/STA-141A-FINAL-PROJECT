@@ -1,0 +1,430 @@
+---
+title: "STA 141A: Predicting Wildfire Incidence in the United States"
+author: "Pavish Sanghu"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Abstract
+Wildfire records in the United States contain a large number of small fires, which makes it difficult to focus on events that are meaningful for prediction. This project constructs a modeling data set that aggregates wildfire records into state by month observations. The response variable is a binary indicator for whether a notable wildfire occurs in a state during a given month. Notable fires are defined using a 300 acre threshold, and a complete state month grid is constructed so that both fire and non fire months are represented in the data set. Exploratory analysis is used to examine how wildfire incidence varies across states and over time. Predictive models are then fit using temporal, geographic, and wildfire related predictors, including previous month wildfire incidence, lightning caused fire counts, and average containment duration. The final goal of the project is to compare predictive models for estimating wildfire incidence while preserving the spatial and temporal structure of the data.
+
+
+
+
+## Data and background
+This project uses a subset of historical wildfire records derived from the Kaggle data set "188 Million US Wildfires." This data set includes wildfire ignition locations, discovery dates, containment dates, causes of ignition, and final burned area across the United States. For this report, the provided sample file is used rather than the full data set.
+
+Wildfires vary widely in size, and the majority of recorded fires are very small and quickly contained. Modeling all fires would create a major class imbalance and make it harder to focus on the wildfire events that are most meaningful for prediction.
+
+To address this, notable fires are defined using a 300 acre cutoff. This threshold is consistent with wildfire reporting standards in which large wildland fires are often defined as at least 100 acres in timber fuel models or at least 300 acres in grass or brush fuel models.
+
+All analysis in this report apply the 300 acre threshold consistently across preprocessing, modeling, and validation.
+
+## 1. Data Preprocessing
+
+This section loads the packages used throughout the project and imports the wildfire sample data. It also starts the preprocessing steps needed to prepare the data for the analysis that follows.
+
+```{r}
+#Libraries plus data package for processing
+library(tidyverse)
+library(lubridate)
+library(leaflet)
+library(sf)
+library(maps)
+library(htmltools)
+library(scales)
+library(randomForest)
+library(pROC)
+
+
+#Wildfire data (Not full, provided set)
+WILDFIRES<-read.csv("wildfires_sample_100k.csv")
+```
+
+
+The raw wildfire data uses year and day of year instead of a regular calendar date system. This code changes those fields into proper date variables, which can then be used for later observations in the project.
+```{r}
+#Will help us build FIRE_DATE from FIRE_YEAR and DISC_DOY
+WILDFIRES<-WILDFIRES %>% 
+  mutate(
+    FIRE_DATE=ymd(paste(FIRE_YEAR,1,1))+days(DISCOVERY_DOY-1),
+    CONT_DATE=as.Date(CONT_DATE, origin="1899-12-30"),
+    FIRE_MONTH=floor_date(FIRE_DATE, unit="month"),
+    CONTAINMENT_DAYS=as.numeric(CONT_DATE-FIRE_DATE)
+  )
+
+#head for first 6 rows
+WILDFIRES %>% 
+  select(FIRE_YEAR, DISCOVERY_DOY, FIRE_DATE, CONT_DATE, FIRE_MONTH, CONTAINMENT_DAYS) %>% 
+  head()
+```
+
+
+Due to the data set having many smaller fires, a binary indicator is created for notable wildfires. Fires with a final burn area of 300 acres or more are classified as notable fires, while fires below that threshold are classified as non notable fires.
+```{r}
+#Notable Fires is using a 300 acre cutoff
+#smaller fires get sent to 0, if not they'll be labeled as 1
+WILDFIRES<-WILDFIRES %>% 
+  mutate(
+    NOTABLE_FIRE=ifelse(FIRE_SIZE>=300, 1,0)
+  )
+
+#Table of notable fires vs non notable (0 is non notable, 1 is notable)
+table(WILDFIRES$NOTABLE_FIRE)
+```
+
+
+
+To build a data set in state month format, a grid of observed states and months is created across the sample period. This makes sure that both wildfire months and non wildfire months are included in the final data set for later modeling and analysis.
+```{r}
+#will help make all the possible state and month combos, will help keep months with and without notable fires
+STATE_TIME_GRID<-expand_grid(
+  STATE=sort(unique(WILDFIRES$STATE)),
+  FIRE_MONTH=seq(min(WILDFIRES$FIRE_MONTH, na.rm=TRUE),
+                 max(WILDFIRES$FIRE_MONTH, na.rm=TRUE),
+                 by="month")
+)
+
+#will add year and month variables
+STATE_TIME_GRID<-STATE_TIME_GRID %>% 
+  mutate(
+    FIRE_YEAR=year(FIRE_MONTH),
+    MONTH_NUM=month(FIRE_MONTH),
+    MONTH_NAME=month(FIRE_MONTH, label=TRUE, abbr=TRUE),
+    MONTH_NAME=factor(MONTH_NAME, levels=month.abb)
+  )
+
+head(STATE_TIME_GRID)
+```
+
+
+
+The wildfire records are then grouped by state and month to create a summary of the data set. This summary includes the total number of fires, the number of notable fires, fire size statistics, lightning caused fire counts, and average containment duration for each state month combination.
+```{r}
+STATE_MONTH_SUMMARY<-WILDFIRES %>% 
+  group_by(STATE, FIRE_MONTH) %>% 
+  summarize(
+    TOTAL_FIRES=n(),
+    NOTABLE_FIRES=sum(NOTABLE_FIRE, na.rm=TRUE),
+    MAX_FIRE_SIZE=max(FIRE_SIZE, na.rm=TRUE),
+    MED_FIRE_SIZE=median(FIRE_SIZE, na.rm=TRUE),
+    LIGHTNING_FIRE_COUNT=sum(STAT_CAUSE_DESCR=="Lightning", na.rm=TRUE),
+    AVG_CONTAINMENT_DAYS=mean(CONTAINMENT_DAYS, na.rm=TRUE),
+    .groups="drop"
+  )
+
+head(STATE_MONTH_SUMMARY)
+```
+
+
+The summarized wildfire counts are then joined to the state month grid to create the data set used for modeling. Missing values are replaced with zeros so that months with no wildfire activity still remain in the data set as meaningful observations rather than missing values.
+```{r}
+MODEL_DATA<-STATE_TIME_GRID%>% 
+  left_join(STATE_MONTH_SUMMARY, by=c("STATE", "FIRE_MONTH")) %>% 
+  mutate(
+    TOTAL_FIRES=replace_na(TOTAL_FIRES,0),
+    NOTABLE_FIRES=replace_na(NOTABLE_FIRES, 0),
+    MAX_FIRE_SIZE=replace_na(MAX_FIRE_SIZE, 0),
+    MED_FIRE_SIZE=replace_na(MED_FIRE_SIZE, 0),
+    LIGHTNING_FIRE_COUNT=replace_na(LIGHTNING_FIRE_COUNT, 0),
+    AVG_CONTAINMENT_DAYS=replace_na(AVG_CONTAINMENT_DAYS, 0)
+  )
+
+head(MODEL_DATA)
+```
+
+
+
+The response variable for prediction is then created. Each state month gets a value of 1 if at least one notable wildfire occurred and 0 otherwise. A previous month wildfire incidence variable is also created to capture whether a notable wildfire occurred in that state during the month before.
+```{r}
+MODEL_DATA<-MODEL_DATA %>% 
+  mutate(
+    WILDFIRE_INCIDENCE=ifelse(NOTABLE_FIRES>0, 1, 0)
+  ) %>% 
+  arrange(STATE, FIRE_MONTH) %>% 
+  group_by(STATE) %>% 
+  mutate(
+    PREV_MONTH_INCIDENCE=lag(WILDFIRE_INCIDENCE, default=0)
+  ) %>% 
+  ungroup()
+
+table(MODEL_DATA$WILDFIRE_INCIDENCE)
+```
+
+Additional predictors are then created to capture more information about wildfire activity. These include the month factor, year index, previous month wildfire incidence, lightning caused fire count, and average containment duration.
+```{r}
+#This will add month related predictors for modeling, will help us capture seasonality during wildfire activity
+MODEL_DATA<-MODEL_DATA %>% 
+  mutate(
+    MONTH_FACTOR=factor(MONTH_NUM),
+    YEAR_INDEX=FIRE_YEAR-min(FIRE_YEAR)
+  )
+head(MODEL_DATA)
+```
+
+
+This summarizes the final modeling data set and checks the balance between wildfire and non wildfire observations across the state month data.
+```{r}
+#Summary of the Modeling Dataset 
+MODEL_DATA %>% 
+  summarize(
+    TOTAL_ROWS=n(),
+    STATES=n_distinct(STATE),
+    MONTHS=n_distinct(FIRE_MONTH),
+    FIRE_MONTHS=sum(WILDFIRE_INCIDENCE),
+    NON_FIRE_MONTHS=sum(WILDFIRE_INCIDENCE==0)
+  )
+```
+
+
+Final check for the variable names and the dimensions of the data
+```{r}
+#Check count for rows and existing cols in part 1
+#dimensions of modeling data set
+dim(MODEL_DATA)
+
+#check variable names
+names(MODEL_DATA)
+```
+
+
+
+## 2. Exploratory Data Analysis  
+This section will explore spatial and temporal patterns in the wildfire incidence found in the data set.The images below summarize seasonality, variation of geography across states, and the changes in wildfire occurrences over time.
+
+
+The first plot shows wildfire incidence by calendar month. This will help us identify whether notable wildfire occurrences follow seasonal patterns in the US. This strong seasonal pattern motivates the inclusion of MONTH_FACTOR as a predictor in both models.
+```{r fig.height=5}
+EDA_MONTH<-MODEL_DATA %>% 
+  group_by(MONTH_NAME) %>% 
+  summarize(
+    FIRE_RATE=mean(WILDFIRE_INCIDENCE)
+  )
+
+ggplot(EDA_MONTH, aes(x=MONTH_NAME,
+                      y=FIRE_RATE,
+                      fill=FIRE_RATE))+
+  geom_col()+
+  scale_fill_gradient(name="Fire Rate",
+                      low="lightpink2",
+                      high="red3")+
+  scale_y_continuous(labels=percent_format())+
+  labs(
+    title="Wildfire Incidence by Month",
+    x="Month",
+    y="Proportion of State-Months with a Notable Wildfire"
+  )+
+  theme_classic()
+```
+
+This plot summarizes wildfire incidence by state. This will allow us to compare how often notable wildfire months occur across the country. This geographic variation motivates the inclusion of STATE as a predictor to capture location based differences in wildfire risk.
+```{r fig.width=10}
+EDA_STATE<-MODEL_DATA %>% 
+  group_by(STATE) %>% 
+  summarize(
+    FIRE_RATE=mean(WILDFIRE_INCIDENCE)
+  )
+ggplot(EDA_STATE, aes(x=reorder(STATE, FIRE_RATE),
+                      y=FIRE_RATE,
+                      fill=FIRE_RATE))+
+  geom_col()+
+  scale_fill_gradient(low="lightpink2",
+                      high="red3")+
+  scale_y_continuous(labels=percent_format())+
+  labs(
+    title="Wildfire Incidence by State",
+    x="State",
+    y="Proportion of State-Months with a Notable Wildfire"
+  )+
+  theme_classic()+
+  theme(
+    axis.text.x=element_text(angle=90, vjust=0.5),
+    legend.position="none"
+  )
+```
+
+
+This plot shows wildfire incidence by year, allowing us to assess whether notable wildfire activity changes over time or remains relatively stable. This variation over time motivates the inclusion of YEAR_INDEX as a predictor to account for long term trends in wildfire activity.
+```{r fig.height=5}
+EDA_YEAR<-MODEL_DATA %>% 
+  group_by(FIRE_YEAR) %>% 
+  summarize(FIRE_RATE=mean(WILDFIRE_INCIDENCE))
+
+ggplot(EDA_YEAR, aes(x=FIRE_YEAR,
+                     y=FIRE_RATE,
+                     fill=FIRE_RATE))+
+  geom_col()+
+  scale_fill_gradient(low="lightpink",
+                      high="red3")+
+  scale_y_continuous(labels=percent_format())+
+  labs(
+    title="Wildfire Incidence by Year",
+    x="Year",
+    y="Proportion of State-Months with a Notable Wildfire"
+  )+
+  theme_classic()+
+  theme(
+    legend.position="none")
+```
+
+
+This is an interactive map adapted from STS 101 that gives a summary of wildfire incidence across states. It allows for a user to understand the geographic data much more easily than the bar graphs by giving it a more three dimensional and accessible look, further confirming that state level geography is an important predictor of wildfire incidence.
+```{r}
+#This is an interactive map, adapted from STS101 and modified to fit the wildfire incidence that we have in the final project data set
+
+STATE_FIRE<-MODEL_DATA %>% 
+  group_by(STATE) %>% 
+  summarize(
+    FIRE_RATE=mean(WILDFIRE_INCIDENCE)
+  )
+
+us_map<-st_as_sf(map("state", plot=FALSE, fill=TRUE)) %>% 
+  mutate(
+    STATE_NAME=str_to_title(ID),
+    STATE=state.abb[match(STATE_NAME, state.name)]
+  ) %>% 
+  filter(!is.na(STATE))
+
+map_data<-right_join(us_map, STATE_FIRE, by="STATE")
+
+palette<-colorNumeric(
+  c("lightpink2", "red3"),
+  domain=map_data$FIRE_RATE
+)
+
+state_text<-str_c(
+  "State: ", map_data$STATE_NAME,
+  "<br>Percent of state-months with at least one notable wildfire: ",
+  percent(map_data$FIRE_RATE, accuracy=0.1)
+) %>% 
+  lapply(htmltools::HTML)
+
+map<-leaflet() %>% 
+  addTiles() %>% 
+  setView(lat=39.5, lng=-98.35, zoom=4) %>% 
+  addLegend(
+    pal=palette,
+    values=map_data$FIRE_RATE,
+    opacity=.75,
+    title="Wildfire incidence rate",
+    position="bottomright",
+    labFormat=labelFormat(suffix="%", transform=function(x) 100*x)
+  ) %>% 
+  addPolygons(
+    data=map_data,
+    fillColor=~palette(FIRE_RATE),
+    smoothFactor=.5,
+    fillOpacity=.75,
+    stroke=TRUE,
+    color="black",
+    weight=1,
+    label=state_text
+  )
+
+map
+```
+
+## 3. Modeling
+This section compares two predictive approaches for estimating wildfire incidence at the state/month level. A logistic regression model is used as a baseline and is compared to a random forest model, which is a more flexible method. To make sure the time ordering is preserved, the data is split into training and test sets by year. Observations from 2014 and earlier are used for training, while later observations are used for testing.
+
+```{r}
+TRAIN_DATA<-MODEL_DATA %>% 
+  filter(FIRE_YEAR<=2014)
+TEST_DATA<-MODEL_DATA %>% 
+  filter(FIRE_YEAR>2014)
+```
+
+
+
+
+This model is a logistic regression which predicts wildfire incidence using month, year, state, previous month incidence, lightning fire count, and average containment days.
+
+$$\log\left(\frac{p}{1-p}\right)= \beta_0+\beta_1(\text{MONTH_FACTOR})+ \beta_2(\text{YEAR_INDEX})+
+\beta_3(\text{STATE})+ \beta_4(\text{PREV_MONTH_INCIDENCE})+ \beta_5(\text{LIGHTNING_FIRE_COUNT})+ \beta_6(\text{AVG_CONTAINMENT_DAYS})$$
+```{r}
+LOG_MODEL<-glm(
+  WILDFIRE_INCIDENCE~MONTH_FACTOR+YEAR_INDEX+STATE+
+    PREV_MONTH_INCIDENCE+LIGHTNING_FIRE_COUNT+AVG_CONTAINMENT_DAYS,
+  data=TRAIN_DATA,
+  family=binomial
+)
+summary(LOG_MODEL)
+```
+
+
+This model is a random forest using the same predictors. Unlike logistic regression, random forest can capture nonlinear relationships and interactions between predictors such as state and month without requiring any distributional assumptions. This makes it a strong candidate for comparison against the logistic regression baseline.
+```{r}
+RANDOM_MODEL<-randomForest(
+  factor(WILDFIRE_INCIDENCE)~MONTH_FACTOR+YEAR_INDEX+STATE+
+    PREV_MONTH_INCIDENCE+LIGHTNING_FIRE_COUNT+AVG_CONTAINMENT_DAYS,
+  data=TRAIN_DATA,
+  ntree=500
+)
+RANDOM_MODEL
+```
+
+## 4. Model Fitting and Validation
+This section evaluates model performance on the test set. ROC curves and AUC are used to compare how well the two models distinguish wildfire months from non wildfire months. These results help show which model gives better predictive performance on the held-out data.
+
+```{r}
+LOG_PREDICTION<-predict(LOG_MODEL, 
+                        newdata=TEST_DATA,
+                        type="response")
+RANDOM_PREDICTION<-predict(RANDOM_MODEL,
+                           newdata=TEST_DATA,
+                           type="prob")[,2]
+```
+
+```{r}
+LOG_ROC<-roc(TEST_DATA$WILDFIRE_INCIDENCE, LOG_PREDICTION)
+RANDOM_ROC<-roc(TEST_DATA$WILDFIRE_INCIDENCE, RANDOM_PREDICTION)
+
+```
+```{r}
+auc(LOG_ROC)
+auc(RANDOM_ROC)
+
+AUC_RESULTS<-data.frame(
+  MODEL=c("Logistic Regression", "Random Forest"),
+  AUC=c(as.numeric(auc(LOG_ROC)),
+        as.numeric(auc(RANDOM_ROC)))
+)
+AUC_RESULTS
+```
+
+The ROC curves below provide a visual comparison of the predictive performance of the two models on the test set.
+```{r fig.width=5}
+plot(LOG_ROC,
+     col="red",
+     lwd=2,
+     main="ROC Curves for Wildfire Prediction Models")
+
+plot(RANDOM_ROC,
+     col="green",
+     lwd=2,
+     add=TRUE)
+legend("bottomright",
+       legend=c("Logistic Regression", "Random Forest"),
+       col=c("red","green"),
+       lwd=2,
+       cex=.7,
+       bty="n")
+```
+
+
+### 5. Summary
+
+This project built a state by month dataset to predict whether a notable wildfire would occur in a given month. The exploratory analysis showed clear patterns across time and geography. Wildfire incidence was highest in the summer, especially during July and August, and lowest in the winter months. The state level results show strong geographic differences, California, Texas and Arizona, having much higher wildfire incidence than many states in the Midwest and Northeast. The yearly results suggest that wildfire incidence also changed over time, with some years showing noticeably higher wildfire activity than others.
+
+Two models were compared to predict wildfire incidence: logistic regression and random forest. Based on the ROC curves, logistic regression performed slightly better than the random forest model on the test set. This suggests that even a relatively simple model using factors such as month, year, state, previous incidence, lightning fire count, and average containment days can show important patterns.
+
+Overall the results show that wildfire incidence is strongly related to season and location. These variables provide useful predictive information at a state and month level. One of the big limitations of this analysis is that models do not include environmental factors such as temperature, drought, wind or even vegetation. To improve these predictions collecting data on various other factors can make this model much more accurate.
+
+
+
+
